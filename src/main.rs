@@ -47,7 +47,7 @@ enum Direction {
     SpiralRight,
 }
 
-#[derive(Parser)]
+#[derive(Parser, Clone)]
 #[command(version, about, long_about = None)]
 struct Args {
     #[clap(short, long, value_enum, default_value = "default")]
@@ -68,38 +68,6 @@ struct Args {
     #[clap(short, long, default_value = "1")]
     /// spaces between 2 messages
     spaces: u16,
-}
-
-fn spawn_stdin_channel() -> Receiver<String> {
-    let (tx, rx) = mpsc::channel::<String>();
-    spawn(move || {
-        loop {
-            let mut buffer = String::new();
-            io::stdin().read_line(&mut buffer).unwrap();
-            if buffer.is_empty() {
-                break;
-            }
-            let buffer = buffer.replace("\n", "");
-            tx.send(buffer).unwrap();
-        }
-    });
-    rx
-}
-
-fn place_cursor(x: u16, y: u16) {
-    print!("{esc}[{y};{x}H", esc = 27 as char);
-}
-
-fn enter_matrix() {
-    print!("{esc}[?1049h", esc = 27 as char)
-}
-fn exit_matrix() {
-    print!("{esc}[?1049l", esc = 27 as char)
-}
-
-// archimean spiral
-fn r(angle: f32, a: f32) -> f32 {
-    a / angle
 }
 
 #[derive(Clone)]
@@ -205,128 +173,196 @@ impl ColumnMat {
     }
 }
 
-impl Drop for ColumnMat {
-    fn drop(&mut self) {
-        exit_matrix();
+struct Matrix {
+    width: u16,
+    height: u16,
+    center_x: u16,
+    center_y: u16,
+    spiral_length: usize,
+    columns: Vec<ColumnMat>,
+    opt: Args,
+    stdin_channel: Receiver<String>,
+    rng: ThreadRng,
+    spiral_coef: f32,
+}
+
+impl Matrix {
+    fn new(opt: Args) -> Matrix {
+        let (Width(width), Height(height)) = terminal_size().unwrap();
+        let spiral_length = Matrix::get_spiral_length(height, width);
+        let columns = Matrix::get_columns(width, height, spiral_length, &opt);
+        let stdin_channel = Matrix::spawn_stdin_channel();
+        let rng = rand::rng();
+        let spiral_coef = 1500.;
+        let (center_x, center_y) = ((width / 2), (height / 2));
+        ctrlc::set_handler(Matrix::exit_matrix).expect("Error setting Ctrl-C handler");
+
+        Matrix {
+            width,
+            height,
+            center_x,
+            center_y,
+            spiral_length,
+            columns,
+            opt,
+            rng,
+            stdin_channel,
+            spiral_coef,
+        }
+    }
+
+    fn get_spiral_length(height: u16, width: u16) -> usize {
+        ((height + width) * 2) as usize
+    }
+
+    fn get_columns(width: u16, height: u16, spiral_length: usize, opt: &Args) -> Vec<ColumnMat> {
+        match opt.direction {
+            Direction::SpiralRight => vec![
+                ColumnMat::new(
+                    spiral_length,
+                    opt.color,
+                    opt.highlight_color,
+                    opt.highlight_threshold
+                );
+                1
+            ],
+
+            Direction::Top | Direction::Bottom => vec![
+                ColumnMat::new(
+                    height as usize,
+                    opt.color,
+                    opt.highlight_color,
+                    opt.highlight_threshold
+                );
+                width as usize
+            ],
+        }
+    }
+
+    fn update_mat(&mut self) {
+        let (Width(width), Height(height)) = terminal_size().unwrap();
+        if self.width != width || self.height != height {
+            self.height = height;
+            self.width = width;
+
+            (self.center_x, self.center_y) = ((self.width / 2), (self.height / 2));
+
+            self.spiral_length = Matrix::get_spiral_length(height, width);
+            self.columns = Matrix::get_columns(width, height, self.spiral_length, &self.opt);
+            Matrix::clean_matrix();
+        }
+    }
+
+    fn update_inputs(&mut self) -> Option<()> {
+        let mut found_end = false;
+        while !found_end {
+            match self.stdin_channel.try_recv() {
+                Ok(key) => {
+                    let w_idx = (self.rng.random::<u16>() % self.columns.len() as u16) as usize;
+                    self.columns[w_idx].add_line(key);
+                }
+                Err(TryRecvError::Empty) => found_end = true,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        if !found_end {
+            return None;
+        }
+        Some(())
+    }
+
+    fn spawn_stdin_channel() -> Receiver<String> {
+        let (tx, rx) = mpsc::channel::<String>();
+        spawn(move || {
+            loop {
+                let mut buffer = String::new();
+                io::stdin().read_line(&mut buffer).unwrap();
+                if buffer.is_empty() {
+                    break;
+                }
+                let buffer = buffer.replace("\n", "");
+                tx.send(buffer).unwrap();
+            }
+        });
+        rx
+    }
+
+    fn spiral_exec(&mut self) {
+        for i in 1..self.spiral_length {
+            let (letter, color) = self.columns[0].get_next(&Direction::SpiralRight);
+            let index = i as f32;
+            let x = (self.r(index) * index.cos()).floor() as i16;
+            let y = (self.r(index) * index.sin()).floor() as i16;
+            let x_abs = (self.center_x as i16 + x) as u16;
+            let y_abs = (self.center_y as i16 + y) as u16;
+
+            if x_abs < self.width && y_abs < self.height {
+                self.place_cursor(x_abs, y_abs);
+                println!("{}{letter}{}", color.to_ansi(), Color::Default.to_ansi());
+            }
+        }
+    }
+
+    fn directional_exec(&mut self) {
+        for _h in 0..self.height {
+            let mut line = String::new();
+            for col in self.columns.iter_mut() {
+                let (letter, color) = col.get_next(&self.opt.direction);
+                line += &format!("{}{letter}{}", color.to_ansi(), Color::Default.to_ansi());
+            }
+            println!("{line}{}", Color::Default.to_ansi());
+        }
+    }
+
+    fn main_loop(&mut self) {
+        let delta_t = Duration::from_millis(self.opt.frequency);
+        Matrix::enter_matrix();
+        loop {
+            // update the size of window dynamically
+            let now = Instant::now();
+            self.update_mat();
+            if self.update_inputs().is_none() {
+                return;
+            }
+
+            for col in self.columns.iter_mut() {
+                col.tick(self.opt.spaces);
+            }
+
+            self.place_cursor(1, 1);
+            match self.opt.direction {
+                Direction::SpiralRight => self.spiral_exec(),
+                Direction::Top | Direction::Bottom => self.directional_exec(),
+            };
+
+            // speed limitation
+            let elapsed_time = now.elapsed();
+            let remaining_time = delta_t - elapsed_time;
+            sleep(remaining_time);
+        }
+    }
+
+    fn place_cursor(&self, x: u16, y: u16) {
+        print!("{esc}[{y};{x}H", esc = 27 as char);
+    }
+
+    fn clean_matrix() {
+        print!("{esc}[2J", esc = 27 as char)
+    }
+    fn enter_matrix() {
+        print!("{esc}[?1049h", esc = 27 as char)
+    }
+    fn exit_matrix() {
+        print!("{esc}[?1049l", esc = 27 as char)
+    }
+
+    // archimean spiral
+    fn r(&mut self, angle: f32) -> f32 {
+        self.spiral_coef / angle
     }
 }
 
 fn main() {
     let opt = Args::parse();
-    let delta_t = Duration::from_millis(opt.frequency);
-    let (Width(mut width), Height(mut height)) = terminal_size().unwrap();
-    let spiral_coef = 1500.;
-    let mut rng = rand::rng();
-
-    let stdin_channel = spawn_stdin_channel();
-
-    let mut spiral_length = (height + width) * 2;
-    let mut columns = match opt.direction {
-        Direction::SpiralRight => vec![
-            ColumnMat::new(
-                spiral_length as usize,
-                opt.color,
-                opt.highlight_color,
-                opt.highlight_threshold
-            );
-            1
-        ],
-
-        Direction::Top | Direction::Bottom => vec![
-            ColumnMat::new(
-                height as usize,
-                opt.color,
-                opt.highlight_color,
-                opt.highlight_threshold
-            );
-            width as usize
-        ],
-    };
-    // clear screen
-    enter_matrix();
-    loop {
-        // update the size of window dynamically
-        let (Width(r_width), Height(r_height)) = terminal_size().unwrap();
-        if r_width != width || r_height != height {
-            height = r_height;
-            width = r_width;
-
-            spiral_length = (height + width) * 2;
-            columns = match opt.direction {
-                Direction::SpiralRight => vec![
-                    ColumnMat::new(
-                        spiral_length as usize,
-                        opt.color,
-                        opt.highlight_color,
-                        opt.highlight_threshold
-                    );
-                    1
-                ],
-
-                Direction::Top | Direction::Bottom => vec![
-                    ColumnMat::new(
-                        height as usize,
-                        opt.color,
-                        opt.highlight_color,
-                        opt.highlight_threshold
-                    );
-                    width as usize
-                ],
-            };
-        }
-        let now = Instant::now();
-        let mut found_end = true;
-        while found_end {
-            match stdin_channel.try_recv() {
-                Ok(key) => {
-                    let w_idx = (rng.random::<u16>() % columns.len() as u16) as usize;
-                    columns[w_idx].add_line(key);
-                }
-                Err(TryRecvError::Empty) => found_end = false,
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-        if found_end {
-            break;
-        }
-
-        for col in columns.iter_mut() {
-            col.tick(opt.spaces);
-        }
-
-        place_cursor(1, 1);
-        match opt.direction {
-            Direction::SpiralRight => {
-                let (center_x, center_y) = ((width / 2) as i16, (height / 2) as i16);
-                for i in 1..spiral_length {
-                    let (letter, color) = columns[0].get_next(&Direction::SpiralRight);
-                    let index = i as f32;
-                    let x = (r(index, spiral_coef) * index.cos()).floor() as i16;
-                    let y = (r(index, spiral_coef) * index.sin()).floor() as i16;
-                    let x_abs = (center_x + x) as u16;
-                    let y_abs = (center_y + y) as u16;
-
-                    if x_abs < width && y_abs < height {
-                        place_cursor(x_abs, y_abs);
-                        println!("{}{letter}{}", color.to_ansi(), Color::Default.to_ansi());
-                    }
-                }
-            }
-            Direction::Top | Direction::Bottom => {
-                // reposition the cursor
-                for _h in 0..height {
-                    let mut line = String::new();
-                    for col in columns.iter_mut() {
-                        let (letter, color) = col.get_next(&opt.direction);
-                        line += &format!("{}{letter}{}", color.to_ansi(), Color::Default.to_ansi());
-                    }
-                    println!("{line}{}", Color::Default.to_ansi());
-                }
-            }
-        }
-        // speed limitation
-        let elapsed_time = now.elapsed();
-        let remaining_time = delta_t - elapsed_time;
-        sleep(remaining_time);
-    }
+    Matrix::new(opt).main_loop();
 }
