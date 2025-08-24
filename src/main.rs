@@ -180,6 +180,7 @@ struct Matrix {
     center_y: u16,
     spiral_length: usize,
     columns: Vec<ColumnMat>,
+    posible_positions: Vec<(u16, u16)>,
     opt: Args,
     stdin_channel: Receiver<String>,
     rng: ThreadRng,
@@ -193,22 +194,25 @@ impl Matrix {
         let columns = Matrix::get_columns(width, height, spiral_length, &opt);
         let stdin_channel = Matrix::spawn_stdin_channel();
         let rng = rand::rng();
-        let spiral_coef = 1500.;
+        let spiral_coef = 100.;
         let (center_x, center_y) = ((width / 2), (height / 2));
         ctrlc::set_handler(Matrix::exit_matrix).expect("Error setting Ctrl-C handler");
 
-        Matrix {
+        let mut mat = Matrix {
             width,
             height,
             center_x,
             center_y,
             spiral_length,
             columns,
+            posible_positions: vec![],
             opt,
             rng,
             stdin_channel,
             spiral_coef,
-        }
+        };
+        mat.spiral_coord_create();
+        mat
     }
 
     fn get_spiral_length(height: u16, width: u16) -> usize {
@@ -226,7 +230,6 @@ impl Matrix {
                 );
                 1
             ],
-
             Direction::Top | Direction::Bottom => vec![
                 ColumnMat::new(
                     height as usize,
@@ -250,6 +253,7 @@ impl Matrix {
             self.spiral_length = Matrix::get_spiral_length(height, width);
             self.columns = Matrix::get_columns(width, height, self.spiral_length, &self.opt);
             Matrix::clean_matrix();
+            self.spiral_coord_create();
         }
     }
 
@@ -287,19 +291,37 @@ impl Matrix {
         rx
     }
 
-    fn spiral_exec(&mut self) {
-        for i in 1..self.spiral_length {
-            let (letter, color) = self.columns[0].get_next(&Direction::SpiralRight);
+    fn spiral_coord_create(&mut self) {
+        let max = 100000;
+        let (mut x_prev, mut y_prev) = (self.center_x, self.center_y);
+        for i in 1..max {
             let index = i as f32;
-            let x = (self.r(index) * index.cos()).floor() as i16;
+            let x = (self.r(index) * index.cos()).floor() as i16 * 2;
             let y = (self.r(index) * index.sin()).floor() as i16;
-            let x_abs = (self.center_x as i16 + x) as u16;
-            let y_abs = (self.center_y as i16 + y) as u16;
+            let x_abs = self.center_x as i32 + x as i32;
+            let y_abs = self.center_y as i32 + y as i32;
 
-            if x_abs < self.width && y_abs < self.height {
-                self.place_cursor(x_abs, y_abs);
-                println!("{}{letter}{}", color.to_ansi(), Color::Default.to_ansi());
+            if x_abs < 0 || x_abs > self.width as i32 || y_abs < 0 || y_abs > self.height as i32 {
+                continue;
             }
+
+            let x_abs = x_abs as u16;
+            let y_abs = y_abs as u16;
+
+            if x_abs != x_prev || y_abs != y_prev {
+                self.posible_positions.push((x_abs, y_abs));
+            }
+            x_prev = x_abs;
+            y_prev = y_abs;
+        }
+    }
+
+    fn spiral_exec(&mut self) {
+        for (x_abs, y_abs) in &self.posible_positions {
+            let (letter, color) = self.columns[0].get_next(&Direction::SpiralRight);
+
+            self.place_cursor(x_abs.clone(), y_abs.clone());
+            print!("{}{letter}{}", color.to_ansi(), Color::Default.to_ansi());
         }
     }
 
@@ -337,8 +359,10 @@ impl Matrix {
 
             // speed limitation
             let elapsed_time = now.elapsed();
-            let remaining_time = delta_t - elapsed_time;
-            sleep(remaining_time);
+            if delta_t > elapsed_time {
+                let remaining_time = delta_t - elapsed_time;
+                sleep(remaining_time);
+            }
         }
     }
 
@@ -358,7 +382,7 @@ impl Matrix {
 
     // archimean spiral
     fn r(&mut self, angle: f32) -> f32 {
-        self.spiral_coef / angle
+        angle / self.spiral_coef
     }
 }
 
